@@ -882,3 +882,102 @@ class TestWebhookField:
             },
         )
         assert resp.status_code != 422, f"Unexpected validation error: {resp.json()}"
+
+
+class TestWebhookFieldOnOtherEndpoints:
+    """Webhook field acceptance tests for /runs/wait and stateless run endpoints."""
+
+    def test_runs_wait_accepts_webhook_field(self) -> None:
+        """POST /threads/{id}/runs/wait accepts the webhook field without 422."""
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        with patch(
+            "aegra_api.api.runs._get_session_maker",
+            return_value=_make_session_maker(BasicSession()),
+        ):
+            resp = client.post(
+                "/threads/test-thread-123/runs/wait",
+                json={
+                    "assistant_id": "asst-123",
+                    "input": {"message": "test"},
+                    "webhook": "https://example.com/webhook",
+                },
+            )
+
+        assert resp.status_code != 422, f"webhook field rejected by /runs/wait: {resp.json()}"
+
+    def test_runs_wait_accepts_webhook_null(self) -> None:
+        """POST /threads/{id}/runs/wait accepts webhook=null without 422."""
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        with patch(
+            "aegra_api.api.runs._get_session_maker",
+            return_value=_make_session_maker(BasicSession()),
+        ):
+            resp = client.post(
+                "/threads/test-thread-123/runs/wait",
+                json={
+                    "assistant_id": "asst-123",
+                    "input": {"message": "test"},
+                    "webhook": None,
+                },
+            )
+
+        assert resp.status_code != 422, f"webhook=null rejected by /runs/wait: {resp.json()}"
+
+    def test_runs_wait_webhook_field_is_optional(self) -> None:
+        """POST /threads/{id}/runs/wait does not require the webhook field."""
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        with patch(
+            "aegra_api.api.runs._get_session_maker",
+            return_value=_make_session_maker(BasicSession()),
+        ):
+            resp = client.post(
+                "/threads/test-thread-123/runs/wait",
+                json={
+                    "assistant_id": "asst-123",
+                    "input": {"message": "test"},
+                },
+            )
+
+        assert resp.status_code != 422, f"Unexpected validation error: {resp.json()}"
+
+    def test_create_run_with_http_webhook_url(self) -> None:
+        """webhook field accepts plain http:// URLs (not just https://)."""
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs",
+            json={
+                "assistant_id": "asst-123",
+                "input": {"message": "test"},
+                "webhook": "http://internal.service.local:8765/webhook",
+            },
+        )
+        assert resp.status_code != 422, f"http:// webhook URL rejected: {resp.json()}"
+
+    def test_create_run_with_long_webhook_url(self) -> None:
+        """webhook field accepts a URL with query params and path segments."""
+        long_url = "https://hooks.example.com/webhooks/notify?token=abc123&run_id=placeholder&env=production"
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs",
+            json={
+                "assistant_id": "asst-123",
+                "input": {"message": "test"},
+                "webhook": long_url,
+            },
+        )
+        assert resp.status_code != 422, f"Long webhook URL rejected: {resp.json()}"

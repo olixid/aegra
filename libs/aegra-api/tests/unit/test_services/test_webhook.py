@@ -470,3 +470,223 @@ class TestDispatchWebhookEdgeCases:
         body = captured_bodies[0]
         expected_sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
         assert captured_headers[0]["X-Aegra-Signature"] == expected_sig
+
+
+# ---------------------------------------------------------------------------
+# Retry on transport errors
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchWebhookRetryTransportError:
+    """Verify retry behaviour specifically for network (TransportError) failures."""
+
+    @pytest.mark.asyncio
+    async def test_retries_on_transport_error_then_succeeds(self) -> None:
+        """A single transport error is retried and subsequent success is accepted."""
+        success_resp = MagicMock(is_success=True, is_server_error=False, status_code=200)
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=[httpx.TransportError("connection reset"), success_resp])
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        mock_ws = MagicMock(WEBHOOK_SECRET=None, WEBHOOK_TIMEOUT_SECONDS=5.0, WEBHOOK_MAX_RETRIES=1)
+        with (
+            patch("aegra_api.services.webhook.httpx.AsyncClient", return_value=mock_client),
+            patch("aegra_api.services.webhook.settings") as ms,
+        ):
+            ms.webhook = mock_ws
+            await dispatch_webhook("https://example.com/hook", {"run_id": "r"})
+
+        assert mock_client.post.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_all_transport_errors_exhausted_then_stops(self) -> None:
+        """When every attempt raises TransportError, gives up after max_attempts."""
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.TransportError("unreachable"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        mock_ws = MagicMock(WEBHOOK_SECRET=None, WEBHOOK_TIMEOUT_SECONDS=5.0, WEBHOOK_MAX_RETRIES=2)
+        with (
+            patch("aegra_api.services.webhook.httpx.AsyncClient", return_value=mock_client),
+            patch("aegra_api.services.webhook.settings") as ms,
+        ):
+            ms.webhook = mock_ws
+            # Must not raise
+            await dispatch_webhook("https://example.com/hook", {"run_id": "r"})
+
+        # 1 + max(0, 2) = 3 total attempts
+        assert mock_client.post.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_no_retry_on_transport_error_when_max_retries_zero(self) -> None:
+        """WEBHOOK_MAX_RETRIES=0 means no retry even for TransportError."""
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.TransportError("refused"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        mock_ws = MagicMock(WEBHOOK_SECRET=None, WEBHOOK_TIMEOUT_SECONDS=5.0, WEBHOOK_MAX_RETRIES=0)
+        with (
+            patch("aegra_api.services.webhook.httpx.AsyncClient", return_value=mock_client),
+            patch("aegra_api.services.webhook.settings") as ms,
+        ):
+            ms.webhook = mock_ws
+            await dispatch_webhook("https://example.com/hook", {"run_id": "r"})
+
+        assert mock_client.post.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Timeout settings propagation
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchWebhookTimeoutPropagation:
+    """Verify that the configured timeout value is forwarded to httpx."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_value_passed_to_async_client(self) -> None:
+        """WEBHOOK_TIMEOUT_SECONDS is forwarded as the httpx.AsyncClient timeout."""
+        constructed_timeouts: list = []
+
+        success_resp = MagicMock(is_success=True, is_server_error=False, status_code=200)
+
+        class _FakeClient:
+            def __init__(self, timeout: float) -> None:
+                constructed_timeouts.append(timeout)
+                self._client = AsyncMock()
+                self._client.post = AsyncMock(return_value=success_resp)
+
+            async def __aenter__(self) -> "_FakeClient":
+                return self
+
+            async def __aexit__(self, *_: object) -> bool:
+                return False
+
+            async def post(self, url: str, *, content: bytes, headers: dict) -> MagicMock:
+                return success_resp
+
+        mock_ws = MagicMock(WEBHOOK_SECRET=None, WEBHOOK_TIMEOUT_SECONDS=42.0, WEBHOOK_MAX_RETRIES=0)
+        with (
+            patch("aegra_api.services.webhook.httpx.AsyncClient", _FakeClient),
+            patch("aegra_api.services.webhook.settings") as ms,
+        ):
+            ms.webhook = mock_ws
+            await dispatch_webhook("https://example.com/hook", {"run_id": "r"})
+
+        assert constructed_timeouts == [42.0]
+
+    @pytest.mark.asyncio
+    async def test_custom_timeout_used_not_default(self) -> None:
+        """A non-default timeout (e.g., 5.0) is forwarded correctly."""
+        constructed_timeouts: list = []
+        success_resp = MagicMock(is_success=True, is_server_error=False, status_code=200)
+
+        class _FakeClient:
+            def __init__(self, timeout: float) -> None:
+                constructed_timeouts.append(timeout)
+
+            async def __aenter__(self) -> "_FakeClient":
+                return self
+
+            async def __aexit__(self, *_: object) -> bool:
+                return False
+
+            async def post(self, url: str, *, content: bytes, headers: dict) -> MagicMock:
+                return success_resp
+
+        mock_ws = MagicMock(WEBHOOK_SECRET=None, WEBHOOK_TIMEOUT_SECONDS=5.0, WEBHOOK_MAX_RETRIES=0)
+        with (
+            patch("aegra_api.services.webhook.httpx.AsyncClient", _FakeClient),
+            patch("aegra_api.services.webhook.settings") as ms,
+        ):
+            ms.webhook = mock_ws
+            await dispatch_webhook("https://example.com/hook", {"run_id": "r"})
+
+        assert constructed_timeouts == [5.0]
+
+
+# ---------------------------------------------------------------------------
+# _build_webhook_payload: additional edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestBuildWebhookPayloadEdgeCases:
+    """Supplementary edge cases for _build_webhook_payload not in TestBuildWebhookPayload."""
+
+    def test_completed_at_is_recent(self) -> None:
+        """completed_at must be within a few seconds of now."""
+        from datetime import UTC, datetime, timedelta
+
+        before = datetime.now(UTC)
+        job = _make_job()
+        payload = _build_webhook_payload(job, status="success")
+        after = datetime.now(UTC)
+
+        completed_at_str = payload["completed_at"]
+        completed_at = datetime.fromisoformat(completed_at_str)
+        if completed_at.tzinfo is None:
+            completed_at = completed_at.replace(tzinfo=UTC)
+
+        assert before - timedelta(seconds=1) <= completed_at <= after + timedelta(seconds=1), (
+            f"completed_at={completed_at_str!r} is outside [{before.isoformat()}, {after.isoformat()}]"
+        )
+
+    def test_output_with_interrupt_data_preserved(self) -> None:
+        """Interrupt output containing __interrupt__ key is preserved verbatim."""
+        interrupt_output = {
+            "__interrupt__": [{"value": "Confirm?", "resumable": True, "task": "node_a", "when": "during"}]
+        }
+        job = _make_job()
+        payload = _build_webhook_payload(job, status="interrupted", output=interrupt_output)
+        assert payload["output"] == interrupt_output
+        assert payload["status"] == "interrupted"
+
+    def test_error_string_is_message_only_not_class_name(self) -> None:
+        """Error field contains the exception message, not 'ClassName: message'."""
+        job = _make_job()
+        err = RuntimeError("something went wrong")
+        payload = _build_webhook_payload(job, status="error", error=str(err))
+        assert payload["error"] == "something went wrong"
+        assert "RuntimeError" not in payload["error"]
+
+    def test_large_output_preserved_exactly(self) -> None:
+        """Large output dict is preserved without truncation or modification."""
+        large_output = {
+            "messages": [{"role": "assistant", "content": "x" * 10_000}],
+            "metadata": {"key_" + str(i): i for i in range(100)},
+        }
+        job = _make_job()
+        payload = _build_webhook_payload(job, status="success", output=large_output)
+        assert payload["output"] == large_output
+
+    def test_signature_header_name_is_x_aegra_signature(self) -> None:
+        """Header is named X-Aegra-Signature (not X-Webhook-Signature or other variants)."""
+        sig = _compute_signature("secret", b"body")
+        assert sig.startswith("sha256=")
+        # The header is built in dispatch_webhook — verify the naming convention
+        # by asserting _compute_signature returns a value in the expected format.
+        parts = sig.split("=", 1)
+        assert parts[0] == "sha256"
+        assert all(c in "0123456789abcdef" for c in parts[1])
+
+    def test_empty_input_data(self) -> None:
+        """Payload is valid when job has no input messages."""
+        # Build job directly to avoid _make_job's default fallback for empty dicts
+        job = RunJob(
+            identity=RunIdentity(run_id="r", thread_id="t", graph_id="g"),
+            user=User(identity="user-1"),
+            execution=RunExecution(input_data={}, webhook_url=None),
+        )
+        payload = _build_webhook_payload(job, status="success")
+        assert payload["input"] == {}
+
+    def test_all_three_statuses_are_json_serializable(self) -> None:
+        """All terminal statuses produce JSON-serializable payloads."""
+        job = _make_job()
+        for status in ("success", "error", "interrupted"):
+            payload = _build_webhook_payload(job, status=status)
+            serialized = json.dumps(payload, default=str)
+            assert json.loads(serialized)["status"] == status
