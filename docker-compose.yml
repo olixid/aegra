@@ -43,6 +43,8 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./aegra.json:/app/aegra.json:ro
       - ./examples:/app/examples:ro

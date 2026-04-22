@@ -307,3 +307,331 @@ class TestLeaseLossCancellation:
         # Done-key and cleanup MUST happen on normal cancel
         mock_signal_done.assert_awaited_once_with("run-1")
         mock_streaming.cleanup_run.assert_awaited_once_with("run-1")
+
+
+# ---------------------------------------------------------------------------
+# Webhook dispatch from execute_run
+# ---------------------------------------------------------------------------
+
+
+def _make_job_with_webhook(
+    run_id: str = "run-1",
+    webhook_url: str | None = "https://example.com/webhook",
+) -> RunJob:
+    return RunJob(
+        identity=RunIdentity(run_id=run_id, thread_id="thread-1", graph_id="graph-1"),
+        user=User(identity="user-1"),
+        execution=RunExecution(input_data={"msg": "hello"}, webhook_url=webhook_url),
+    )
+
+
+def _base_executor_patches() -> dict:
+    """Common patch targets for execute_run tests."""
+    return {
+        "aegra_api.services.run_executor.update_run_status": AsyncMock(),
+        "aegra_api.services.run_executor.finalize_run": AsyncMock(),
+        "aegra_api.services.run_executor._signal_run_done": AsyncMock(),
+        "aegra_api.services.run_executor._signal_end_event": AsyncMock(),
+    }
+
+
+class TestExecuteRunWebhookDispatch:
+    """Verify that execute_run dispatches webhooks for each terminal state."""
+
+    @pytest.mark.asyncio
+    async def test_webhook_dispatched_on_success(self) -> None:
+        """execute_run fires a webhook when the run completes successfully."""
+        mock_dispatch = AsyncMock()
+        mocks = _base_executor_patches()
+
+        with (
+            patch(
+                "aegra_api.services.run_executor.update_run_status",
+                mocks["aegra_api.services.run_executor.update_run_status"],
+            ),
+            patch(
+                "aegra_api.services.run_executor.finalize_run", mocks["aegra_api.services.run_executor.finalize_run"]
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_run_done",
+                mocks["aegra_api.services.run_executor._signal_run_done"],
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_end_event",
+                mocks["aegra_api.services.run_executor._signal_end_event"],
+            ),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor._stream_graph", new_callable=AsyncMock) as mock_stream,
+            patch("aegra_api.services.run_executor.dispatch_webhook", mock_dispatch),
+        ):
+            mock_streaming.cleanup_run = AsyncMock()
+            mock_output = MagicMock()
+            mock_output.has_interrupt = False
+            mock_output.data = {"messages": [{"role": "assistant", "content": "hi"}]}
+            mock_stream.return_value = mock_output
+
+            from aegra_api.services.run_executor import execute_run
+
+            await execute_run(_make_job_with_webhook())
+
+        mock_dispatch.assert_awaited_once()
+        payload = mock_dispatch.await_args.args[1]
+        assert payload["status"] == "success"
+        assert payload["run_id"] == "run-1"
+
+    @pytest.mark.asyncio
+    async def test_webhook_dispatched_on_error(self) -> None:
+        """execute_run fires a webhook when the graph raises an exception."""
+        mock_dispatch = AsyncMock()
+        mocks = _base_executor_patches()
+
+        with (
+            patch(
+                "aegra_api.services.run_executor.update_run_status",
+                mocks["aegra_api.services.run_executor.update_run_status"],
+            ),
+            patch(
+                "aegra_api.services.run_executor.finalize_run", mocks["aegra_api.services.run_executor.finalize_run"]
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_run_done",
+                mocks["aegra_api.services.run_executor._signal_run_done"],
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_end_event",
+                mocks["aegra_api.services.run_executor._signal_end_event"],
+            ),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch(
+                "aegra_api.services.run_executor._stream_graph",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("graph boom"),
+            ),
+            patch("aegra_api.services.run_executor.dispatch_webhook", mock_dispatch),
+        ):
+            mock_streaming.cleanup_run = AsyncMock()
+            mock_streaming.signal_run_error = AsyncMock()
+
+            from aegra_api.services.run_executor import execute_run
+
+            await execute_run(_make_job_with_webhook())
+
+        mock_dispatch.assert_awaited_once()
+        payload = mock_dispatch.await_args.args[1]
+        assert payload["status"] == "error"
+        assert "graph boom" in payload["error"]
+
+    @pytest.mark.asyncio
+    async def test_webhook_dispatched_on_cancelled_non_lease_loss(self) -> None:
+        """execute_run fires a webhook when the run is cancelled by the user."""
+        mock_dispatch = AsyncMock()
+        mocks = _base_executor_patches()
+
+        with (
+            patch(
+                "aegra_api.services.run_executor.update_run_status",
+                mocks["aegra_api.services.run_executor.update_run_status"],
+            ),
+            patch(
+                "aegra_api.services.run_executor.finalize_run", mocks["aegra_api.services.run_executor.finalize_run"]
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_run_done",
+                mocks["aegra_api.services.run_executor._signal_run_done"],
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_end_event",
+                mocks["aegra_api.services.run_executor._signal_end_event"],
+            ),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch(
+                "aegra_api.services.run_executor._stream_graph",
+                new_callable=AsyncMock,
+                side_effect=asyncio.CancelledError,
+            ),
+            patch("aegra_api.services.run_executor.dispatch_webhook", mock_dispatch),
+        ):
+            mock_streaming.cleanup_run = AsyncMock()
+            mock_streaming.signal_run_cancelled = AsyncMock()
+
+            from aegra_api.services.run_executor import execute_run
+
+            with pytest.raises(asyncio.CancelledError):
+                await execute_run(_make_job_with_webhook())
+
+        mock_dispatch.assert_awaited_once()
+        payload = mock_dispatch.await_args.args[1]
+        assert payload["status"] == "interrupted"
+
+    @pytest.mark.asyncio
+    async def test_webhook_not_dispatched_on_lease_loss_cancel(self) -> None:
+        """execute_run must NOT fire a webhook on lease-loss cancellation."""
+        mock_dispatch = AsyncMock()
+        mocks = _base_executor_patches()
+
+        with (
+            patch(
+                "aegra_api.services.run_executor.update_run_status",
+                mocks["aegra_api.services.run_executor.update_run_status"],
+            ),
+            patch(
+                "aegra_api.services.run_executor.finalize_run", mocks["aegra_api.services.run_executor.finalize_run"]
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_run_done",
+                mocks["aegra_api.services.run_executor._signal_run_done"],
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_end_event",
+                mocks["aegra_api.services.run_executor._signal_end_event"],
+            ),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch(
+                "aegra_api.services.run_executor._stream_graph",
+                new_callable=AsyncMock,
+                side_effect=asyncio.CancelledError,
+            ),
+            patch("aegra_api.services.run_executor.dispatch_webhook", mock_dispatch),
+        ):
+            mock_streaming.cleanup_run = AsyncMock()
+            mock_streaming.signal_run_cancelled = AsyncMock()
+
+            from aegra_api.services.run_executor import _lease_loss_cancellations, execute_run
+
+            _lease_loss_cancellations.add("run-1")
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await execute_run(_make_job_with_webhook())
+            finally:
+                _lease_loss_cancellations.discard("run-1")
+
+        # Lease-loss cancellation MUST NOT dispatch webhook — run is re-enqueued
+        mock_dispatch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_webhook_not_dispatched_when_no_url(self) -> None:
+        """When webhook_url is None, dispatch_webhook must never be called."""
+        mock_dispatch = AsyncMock()
+        mocks = _base_executor_patches()
+
+        with (
+            patch(
+                "aegra_api.services.run_executor.update_run_status",
+                mocks["aegra_api.services.run_executor.update_run_status"],
+            ),
+            patch(
+                "aegra_api.services.run_executor.finalize_run", mocks["aegra_api.services.run_executor.finalize_run"]
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_run_done",
+                mocks["aegra_api.services.run_executor._signal_run_done"],
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_end_event",
+                mocks["aegra_api.services.run_executor._signal_end_event"],
+            ),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor._stream_graph", new_callable=AsyncMock) as mock_stream,
+            patch("aegra_api.services.run_executor.dispatch_webhook", mock_dispatch),
+        ):
+            mock_streaming.cleanup_run = AsyncMock()
+            mock_output = MagicMock(has_interrupt=False, data={})
+            mock_stream.return_value = mock_output
+
+            from aegra_api.services.run_executor import execute_run
+
+            # webhook_url=None
+            await execute_run(_make_job_with_webhook(webhook_url=None))
+
+        mock_dispatch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_webhook_dispatched_on_interrupt(self) -> None:
+        """execute_run fires a webhook with status='interrupted' for human-in-the-loop."""
+        mock_dispatch = AsyncMock()
+        mocks = _base_executor_patches()
+
+        with (
+            patch(
+                "aegra_api.services.run_executor.update_run_status",
+                mocks["aegra_api.services.run_executor.update_run_status"],
+            ),
+            patch(
+                "aegra_api.services.run_executor.finalize_run", mocks["aegra_api.services.run_executor.finalize_run"]
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_run_done",
+                mocks["aegra_api.services.run_executor._signal_run_done"],
+            ),
+            patch(
+                "aegra_api.services.run_executor._signal_end_event",
+                mocks["aegra_api.services.run_executor._signal_end_event"],
+            ),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor._stream_graph", new_callable=AsyncMock) as mock_stream,
+            patch("aegra_api.services.run_executor.dispatch_webhook", mock_dispatch),
+        ):
+            mock_streaming.cleanup_run = AsyncMock()
+            # Simulate interrupt: has_interrupt=True
+            mock_output = MagicMock(has_interrupt=True, data={"__interrupt__": [{"value": "need input"}]})
+            mock_stream.return_value = mock_output
+
+            from aegra_api.services.run_executor import execute_run
+
+            await execute_run(_make_job_with_webhook())
+
+        mock_dispatch.assert_awaited_once()
+        payload = mock_dispatch.await_args.args[1]
+        assert payload["status"] == "interrupted"
+
+    @pytest.mark.asyncio
+    async def test_webhook_failure_does_not_affect_run_status(self) -> None:
+        """A failing webhook call must not propagate — run finalize must still complete."""
+        mock_finalize = AsyncMock()
+
+        with (
+            patch("aegra_api.services.run_executor.update_run_status", AsyncMock()),
+            patch("aegra_api.services.run_executor.finalize_run", mock_finalize),
+            patch("aegra_api.services.run_executor._signal_run_done", AsyncMock()),
+            patch("aegra_api.services.run_executor._signal_end_event", AsyncMock()),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor._stream_graph", new_callable=AsyncMock) as mock_stream,
+            # dispatch_webhook raises — should be swallowed
+            patch("aegra_api.services.run_executor.dispatch_webhook", AsyncMock(side_effect=Exception("network down"))),
+        ):
+            mock_streaming.cleanup_run = AsyncMock()
+            mock_stream.return_value = MagicMock(has_interrupt=False, data={})
+
+            from aegra_api.services.run_executor import execute_run
+
+            # Must not raise despite webhook failure
+            await execute_run(_make_job_with_webhook())
+
+        # Run was still finalized successfully
+        mock_finalize.assert_awaited_once()
+        assert mock_finalize.await_args.kwargs["status"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_webhook_url_passed_to_dispatch_correctly(self) -> None:
+        """The correct URL from the job is passed as the first argument to dispatch_webhook."""
+        mock_dispatch = AsyncMock()
+        url = "https://my-service.example.com/hooks/abc123"
+
+        with (
+            patch("aegra_api.services.run_executor.update_run_status", AsyncMock()),
+            patch("aegra_api.services.run_executor.finalize_run", AsyncMock()),
+            patch("aegra_api.services.run_executor._signal_run_done", AsyncMock()),
+            patch("aegra_api.services.run_executor._signal_end_event", AsyncMock()),
+            patch("aegra_api.services.run_executor.streaming_service") as mock_streaming,
+            patch("aegra_api.services.run_executor._stream_graph", new_callable=AsyncMock) as mock_stream,
+            patch("aegra_api.services.run_executor.dispatch_webhook", mock_dispatch),
+        ):
+            mock_streaming.cleanup_run = AsyncMock()
+            mock_stream.return_value = MagicMock(has_interrupt=False, data={})
+
+            from aegra_api.services.run_executor import execute_run
+
+            await execute_run(_make_job_with_webhook(webhook_url=url))
+
+        dispatched_url = mock_dispatch.await_args.args[0]
+        assert dispatched_url == url

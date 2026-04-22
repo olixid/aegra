@@ -123,3 +123,102 @@ class TestRunJob:
         )
         assert job.execution.input_data == {}
         assert job.behavior.subgraphs is False
+
+
+class TestRunExecutionWebhookUrl:
+    """Tests that webhook_url is properly handled by RunExecution and RunJob serialization."""
+
+    def test_webhook_url_defaults_to_none(self) -> None:
+        execution = RunExecution()
+        assert execution.webhook_url is None
+
+    def test_webhook_url_accepted_as_string(self) -> None:
+        execution = RunExecution(webhook_url="https://example.com/hook")
+        assert execution.webhook_url == "https://example.com/hook"
+
+    def test_webhook_url_serialized_in_to_execution_params(self) -> None:
+        """webhook_url appears in execution_params so workers can retrieve it."""
+        job = RunJob(
+            identity=RunIdentity(run_id="r1", thread_id="t1", graph_id="g1"),
+            user=User(identity="u1"),
+            execution=RunExecution(webhook_url="https://example.com/hook"),
+        )
+        params = job.to_execution_params()
+        assert params["execution"]["webhook_url"] == "https://example.com/hook"
+
+    def test_webhook_url_none_serialized_as_none(self) -> None:
+        """webhook_url=None is explicitly stored (Pydantic model_dump behaviour)."""
+        job = RunJob(
+            identity=RunIdentity(run_id="r1", thread_id="t1", graph_id="g1"),
+            user=User(identity="u1"),
+            execution=RunExecution(webhook_url=None),
+        )
+        params = job.to_execution_params()
+        assert "webhook_url" in params["execution"]
+        assert params["execution"]["webhook_url"] is None
+
+    def test_webhook_url_round_trips_through_from_run_orm(self) -> None:
+        """webhook_url survives to_execution_params → from_run_orm round trip."""
+        job = RunJob(
+            identity=RunIdentity(run_id="r1", thread_id="t1", graph_id="g1"),
+            user=User(identity="u1"),
+            execution=RunExecution(
+                input_data={"msg": "hello"},
+                webhook_url="https://hooks.example.com/run-done",
+            ),
+        )
+        _params = job.to_execution_params()
+
+        class FakeORM:
+            run_id = "r1"
+            thread_id = "t1"
+            execution_params = _params
+
+        restored = RunJob.from_run_orm(FakeORM())
+        assert restored.execution.webhook_url == "https://hooks.example.com/run-done"
+
+    def test_webhook_url_none_round_trips_through_from_run_orm(self) -> None:
+        """webhook_url=None survives the serialization round trip."""
+        job = RunJob(
+            identity=RunIdentity(run_id="r2", thread_id="t2", graph_id="g2"),
+            user=User(identity="u2"),
+            execution=RunExecution(webhook_url=None),
+        )
+        params = job.to_execution_params()
+
+        class FakeORM:
+            run_id = "r2"
+            thread_id = "t2"
+            execution_params = params
+
+        restored = RunJob.from_run_orm(FakeORM())
+        assert restored.execution.webhook_url is None
+
+    def test_old_execution_params_without_webhook_url_loads_as_none(self) -> None:
+        """Execution params stored before webhook support (no webhook_url key) load cleanly."""
+
+        class FakeORM:
+            run_id = "r3"
+            thread_id = "t3"
+            execution_params = {
+                "graph_id": "g3",
+                "user": {"identity": "u3"},
+                "execution": {
+                    "input_data": {"msg": "legacy"},
+                    "config": {},
+                    "context": {},
+                    "stream_mode": None,
+                    "checkpoint": None,
+                    "command": None,
+                    # no webhook_url — old record
+                },
+                "behavior": {
+                    "interrupt_before": None,
+                    "interrupt_after": None,
+                    "multitask_strategy": None,
+                    "subgraphs": False,
+                },
+            }
+
+        restored = RunJob.from_run_orm(FakeORM())
+        assert restored.execution.webhook_url is None
