@@ -167,3 +167,15 @@ When enabled, a `/metrics` endpoint serves standard HTTP request metrics (reques
 | `OTEL_EXPORTER_OTLP_HEADERS` | Headers as comma-separated `key=value` pairs |
 
 See [observability guide](/guides/observability) for configuration examples.
+
+## Webhooks
+
+Aegra can notify an external URL after a run finishes. The URL is supplied per-request by the client (no persistent webhook entity or CRUD API).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WEBHOOK_SECRET` | — | Optional HMAC-SHA256 signing secret. When set, every request includes an `X-Aegra-Signature: sha256=<hex>` header. |
+| `WEBHOOK_TIMEOUT_SECONDS` | `30` | HTTP timeout for webhook delivery (seconds). |
+| `WEBHOOK_MAX_RETRIES` | `1` | Number of additional attempts after a transient failure (network error or 5xx response). |
+
+See [webhook callbacks guide](/guides/webhooks) for usage details and payload format.

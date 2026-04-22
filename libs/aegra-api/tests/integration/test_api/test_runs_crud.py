@@ -829,3 +829,56 @@ class TestWaitForRunTimeouts:
             assert resp.status_code == 200
             # StreamingResponse: body is heartbeat newlines + final JSON
             assert resp.json() == {"partial": "data"}
+
+
+class TestWebhookField:
+    """Tests that the webhook field is accepted and forwarded through the pipeline."""
+
+    def test_create_run_accepts_webhook_field(self) -> None:
+        """webhook field in run creation request is accepted (not rejected with 422)."""
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs",
+            json={
+                "assistant_id": "asst-123",
+                "input": {"message": "test"},
+                "webhook": "https://example.com/webhook",
+            },
+        )
+        # Request is valid (422 would mean webhook field was rejected).
+        # 404 is expected because the assistant doesn't exist in the test DB.
+        assert resp.status_code != 422, f"webhook field was rejected: {resp.json()}"
+
+    def test_create_run_webhook_field_is_optional(self) -> None:
+        """webhook field is optional — omitting it must not cause a validation error."""
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs",
+            json={
+                "assistant_id": "asst-123",
+                "input": {"message": "test"},
+            },
+        )
+        assert resp.status_code != 422, f"Unexpected validation error: {resp.json()}"
+
+    def test_create_run_webhook_null_accepted(self) -> None:
+        """Explicitly passing webhook=null is valid."""
+        app = create_test_app(include_runs=True, include_threads=False)
+        override_session_dependency(app, BasicSession)
+        client = make_client(app)
+
+        resp = client.post(
+            "/threads/test-thread-123/runs",
+            json={
+                "assistant_id": "asst-123",
+                "input": {"message": "test"},
+                "webhook": None,
+            },
+        )
+        assert resp.status_code != 422, f"Unexpected validation error: {resp.json()}"

@@ -7,6 +7,7 @@ Single source of truth for executing a graph run. Both LocalExecutor
 """
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -20,6 +21,7 @@ from aegra_api.services.graph_streaming import stream_graph_events
 from aegra_api.services.langgraph_service import create_run_config, get_langgraph_service
 from aegra_api.services.run_status import finalize_run, update_run_status
 from aegra_api.services.streaming_service import streaming_service
+from aegra_api.services.webhook import dispatch_webhook
 from aegra_api.settings import settings
 from aegra_api.utils.run_utils import map_command_to_langgraph
 
@@ -46,6 +48,7 @@ async def execute_run(job: RunJob) -> None:
     """
     run_id = job.identity.run_id
     thread_id = job.identity.thread_id
+    webhook_url = job.execution.webhook_url
     is_lease_loss = False
 
     try:
@@ -61,6 +64,12 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="interrupted",
                 output=final_output.data,
             )
+            if webhook_url:
+                await _best_effort_signal(
+                    dispatch_webhook,
+                    webhook_url,
+                    _build_webhook_payload(job, status="interrupted", output=final_output.data),
+                )
         else:
             await finalize_run(
                 run_id,
@@ -69,6 +78,12 @@ async def execute_run(job: RunJob) -> None:
                 thread_status="idle",
                 output=final_output.data,
             )
+            if webhook_url:
+                await _best_effort_signal(
+                    dispatch_webhook,
+                    webhook_url,
+                    _build_webhook_payload(job, status="success", output=final_output.data),
+                )
 
     except asyncio.CancelledError:
         if run_id in _lease_loss_cancellations:
@@ -80,12 +95,24 @@ async def execute_run(job: RunJob) -> None:
         else:
             await finalize_run(run_id, thread_id, status="interrupted", thread_status="idle", output={})
             await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)
+            if webhook_url:
+                await _best_effort_signal(
+                    dispatch_webhook,
+                    webhook_url,
+                    _build_webhook_payload(job, status="interrupted"),
+                )
         raise
     except Exception as exc:
         logger.exception("Run failed", run_id=run_id)
         safe_message = f"{type(exc).__name__}: execution failed"
         await finalize_run(run_id, thread_id, status="error", thread_status="error", output={}, error=str(exc))
         await _best_effort_signal(streaming_service.signal_run_error, run_id, safe_message, type(exc).__name__)
+        if webhook_url:
+            await _best_effort_signal(
+                dispatch_webhook,
+                webhook_url,
+                _build_webhook_payload(job, status="error", error=str(exc)),
+            )
     else:
         status = "interrupted" if final_output.has_interrupt else "success"
         await _best_effort_signal(_signal_end_event, run_id, status)
@@ -197,6 +224,31 @@ def _resolve_stream_modes(stream_mode: str | list[str] | None) -> list[str]:
     if isinstance(stream_mode, str):
         return [stream_mode]
     return list(stream_mode)
+
+
+def _build_webhook_payload(
+    job: RunJob,
+    *,
+    status: str,
+    output: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Assemble the webhook POST body from a RunJob and terminal state.
+
+    The payload mirrors what you would receive from ``GET /threads/{id}/runs/{id}``,
+    matching the LangSmith webhook payload convention.
+    """
+    return {
+        "run_id": job.identity.run_id,
+        "thread_id": job.identity.thread_id,
+        "graph_id": job.identity.graph_id,
+        "status": status,
+        "input": job.execution.input_data,
+        "output": output or {},
+        "error": error,
+        "metadata": {},
+        "completed_at": datetime.now(UTC).isoformat(),
+    }
 
 
 # ------------------------------------------------------------------

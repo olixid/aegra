@@ -41,6 +41,7 @@ class RunExecution(BaseModel):
     stream_mode: str | list[str] | None = None
     checkpoint: dict[str, Any] | None = None
     command: dict[str, Any] | None = None
+    webhook_url: str | None = None
 
 
 class RunBehavior(BaseModel):

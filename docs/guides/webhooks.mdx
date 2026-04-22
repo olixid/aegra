@@ -1,0 +1,128 @@
+---
+title: "Webhook Callbacks"
+description: "Notify external services when a run completes."
+---
+
+Aegra supports webhook callbacks compatible with the LangGraph SDK. When a run finishes, Aegra fires a best-effort HTTP POST to the URL you supply — no persistent configuration or CRUD API required. The webhook URL is passed directly on each run-creation call.
+
+## Quick example
+
+```python
+import asyncio
+from langgraph_sdk import get_client
+
+async def main():
+    client = get_client(url="http://localhost:2026")
+
+    thread = await client.threads.create()
+
+    # Pass a webhook URL — Aegra POSTs the result when the run finishes.
+    run = await client.runs.create(
+        thread_id=thread["thread_id"],
+        assistant_id="agent",
+        input={"messages": [{"type": "human", "content": "Hello!"}]},
+        webhook="https://your-service.example.com/hooks/run-complete",
+    )
+    print(run["run_id"])
+
+asyncio.run(main())
+```
+
+The same `webhook` parameter is available on `runs.stream()` and `runs.wait()`:
+
+```python
+# With streaming
+async for chunk in client.runs.stream(
+    thread_id=thread["thread_id"],
+    assistant_id="agent",
+    input={"messages": [{"type": "human", "content": "Hello!"}]},
+    webhook="https://your-service.example.com/hooks/run-complete",
+):
+    ...
+
+# With wait
+result = await client.runs.wait(
+    thread_id=thread["thread_id"],
+    assistant_id="agent",
+    input={"messages": [{"type": "human", "content": "Hello!"}]},
+    webhook="https://your-service.example.com/hooks/run-complete",
+)
+```
+
+## Payload format
+
+Aegra POSTs a JSON body to your webhook URL when the run reaches a terminal state:
+
+```json
+{
+  "run_id": "1ef8b6f5-2a4c-4b3e-9c7a-0d3e8f5a1b2c",
+  "thread_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "graph_id": "agent",
+  "status": "success",
+  "input": { "messages": [{ "type": "human", "content": "Hello!" }] },
+  "output": { "messages": [...] },
+  "error": null,
+  "metadata": {},
+  "completed_at": "2025-04-22T12:34:56.789012+00:00"
+}
+```
+
+The `status` field reflects the run's terminal state:
+
+| Status | Meaning |
+|--------|---------|
+| `success` | Run completed normally |
+| `error` | Run raised an unhandled exception |
+| `interrupted` | Run was paused by an interrupt (human-in-the-loop) |
+| `cancelled` | Run was explicitly cancelled |
+
+## Payload headers
+
+Every webhook request includes:
+
+| Header | Value |
+|--------|-------|
+| `Content-Type` | `application/json` |
+| `X-Aegra-Signature` | `sha256=<hex>` (only when `WEBHOOK_SECRET` is set) |
+
+## HMAC payload signing
+
+To verify that webhook requests originate from your Aegra instance, set the `WEBHOOK_SECRET` environment variable. Aegra will compute an HMAC-SHA256 digest of the raw JSON body and include it in the `X-Aegra-Signature` header:
+
+```bash
+WEBHOOK_SECRET=your-strong-secret
+```
+
+Verify the signature on your webhook receiver:
+
+```python
+import hashlib
+import hmac
+
+def verify_signature(secret: str, body: bytes, signature_header: str) -> bool:
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+```
+
+<Warning>
+  Always use `hmac.compare_digest` for signature comparison to prevent timing attacks.
+</Warning>
+
+## Retry behaviour
+
+Aegra makes a best-effort delivery. Configure retries with environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WEBHOOK_TIMEOUT_SECONDS` | `30` | HTTP timeout per attempt |
+| `WEBHOOK_MAX_RETRIES` | `1` | Additional attempts after a failure (network error or 5xx response) |
+
+With the defaults, a transient 5xx triggers one retry — two total attempts. Client errors (4xx) are logged and not retried.
+
+<Note>
+  Webhook failures never affect the run's persisted status or output. If delivery fails after all attempts, Aegra logs a warning and moves on.
+</Note>
+
+## Environment variables reference
+
+See the [environment variables reference](/reference/environment-variables#webhooks) for the full list of webhook configuration options.

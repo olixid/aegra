@@ -269,6 +269,26 @@ class WorkerSettings(EnvBase):
         return self
 
 
+class WebhookSettings(EnvBase):
+    """Settings for outbound webhook callbacks.
+
+    When a run completes, Aegra can POST the result to a URL supplied by the
+    client at run-creation time (``webhook`` field in RunCreate).
+    """
+
+    WEBHOOK_SECRET: str | None = None
+    """Shared secret for HMAC-SHA256 payload signing.
+
+    When set, each outbound webhook POST includes an ``X-Aegra-Signature``
+    header containing ``sha256=<hex_digest>`` so recipients can verify
+    authenticity. Leave empty to disable signing.
+    """
+    WEBHOOK_TIMEOUT_SECONDS: float = 30.0
+    """HTTP request timeout for outbound webhook calls."""
+    WEBHOOK_MAX_RETRIES: int = 1
+    """Maximum number of retry attempts on transient HTTP errors (5xx, network)."""
+
+
 class Settings:
     def __init__(self) -> None:
         self.app = AppSettings()
@@ -277,6 +297,7 @@ class Settings:
         self.observability = ObservabilitySettings()
         self.redis = RedisSettings()
         self.worker = WorkerSettings()
+        self.webhook = WebhookSettings()
 
 
 settings = Settings()

@@ -58,6 +58,12 @@ class RunCreate(BaseModel):
         description="Nodes to interrupt immediately after they get executed. Use '*' for all nodes.",
     )
 
+    # Webhook callback
+    webhook: str | None = Field(
+        None,
+        description="URL to POST the run result to when the run completes (success, error, or interrupted).",
+    )
+
     # Subgraph configuration
     stream_subgraphs: bool | None = Field(
         False,

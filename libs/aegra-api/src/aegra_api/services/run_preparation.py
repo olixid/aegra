@@ -230,6 +230,7 @@ async def _prepare_run(
             stream_mode=request.stream_mode,
             checkpoint=request.checkpoint,
             command=request.command,
+            webhook_url=request.webhook,
         ),
         behavior=RunBehavior(
             interrupt_before=request.interrupt_before,
